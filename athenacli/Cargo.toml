@@ -1,0 +1,22 @@
+[package]
+name = "athenacli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "athenacli"
+path = "src/main.rs"
+
+[dependencies]
+athenacli-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+reedline.workspace = true
+inquire.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+shellexpand.workspace = true
