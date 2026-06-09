@@ -98,9 +98,13 @@ fn read_execute_arg(arg: &str) -> anyhow::Result<String> {
     }
 }
 
-/// `-e` output: tables only (no status line / timing), matching Python `run_query`.
+/// `-e` output: Athena console URL then result tables (no status line / timing,
+/// matching Python `run_query` plus the REPL's URL line).
 fn run_oneshot(exec: &SqlExecute, query: &str, table_format: &str) -> anyhow::Result<()> {
     for rs in exec.run(query)? {
+        if let Some(url) = exec.console_url(&rs.run.query_execution_id) {
+            println!("Athena URL: {url}");
+        }
         let rendered = output::render(&rs.run.headers, &rs.run.rows, table_format, rs.expanded);
         if !rendered.is_empty() {
             println!("{rendered}");
