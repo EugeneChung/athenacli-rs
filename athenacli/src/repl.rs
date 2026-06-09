@@ -94,7 +94,6 @@ fn run_line(exec: &SqlExecute, cfg: &Config, line: &str) {
                 if cfg.main.timing {
                     println!("Time: {:.3}s", rs.run.elapsed_ms as f64 / 1000.0);
                 }
-                println!("Work group: {}", exec.work_group());
                 if let Some(url) = exec.console_url(&rs.run.query_execution_id) {
                     println!("Athena URL: {url}");
                 }
@@ -104,8 +103,8 @@ fn run_line(exec: &SqlExecute, cfg: &Config, line: &str) {
     }
 }
 
-/// Substitute the Phase 1 prompt placeholders (`\r` region, `\d` database).
-/// Date/time codes are deferred to Phase 4.
+/// Substitute the Phase 1 prompt placeholders (`\r` region, `\d` database,
+/// `\w` workgroup). Date/time codes are deferred to Phase 4.
 fn substitute_prompt(template: &str, exec: &SqlExecute) -> String {
     let region = exec.region.as_deref().unwrap_or("(none)");
     let database = if exec.database.is_empty() {
@@ -113,7 +112,10 @@ fn substitute_prompt(template: &str, exec: &SqlExecute) -> String {
     } else {
         &exec.database
     };
-    template.replace("\\r", region).replace("\\d", database)
+    template
+        .replace("\\r", region)
+        .replace("\\d", database)
+        .replace("\\w", exec.work_group())
 }
 
 struct AthenaPrompt {
