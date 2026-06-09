@@ -94,6 +94,10 @@ fn run_line(exec: &SqlExecute, cfg: &Config, line: &str) {
                 if cfg.main.timing {
                     println!("Time: {:.3}s", rs.run.elapsed_ms as f64 / 1000.0);
                 }
+                println!("Work group: {}", exec.work_group());
+                if let Some(url) = exec.console_url(&rs.run.query_execution_id) {
+                    println!("Athena URL: {url}");
+                }
             }
         }
         Err(err) => eprintln!("{err}"),

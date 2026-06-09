@@ -52,6 +52,19 @@ impl SqlExecute {
         }
     }
 
+    /// Effective Athena workgroup; `primary` when none is configured, matching
+    /// Athena's own default.
+    pub fn work_group(&self) -> &str {
+        self.work_group.as_deref().unwrap_or(athena::DEFAULT_WORK_GROUP)
+    }
+
+    /// AWS console URL for a query execution. `None` when the region is unknown.
+    pub fn console_url(&self, query_execution_id: &str) -> Option<String> {
+        self.region
+            .as_deref()
+            .map(|region| athena::console_url(region, query_execution_id))
+    }
+
     /// Split, strip trailing `;`, detect `\G`, and execute each statement.
     pub fn run(&self, statement: &str) -> anyhow::Result<Vec<ResultSet>> {
         let statement = statement.trim();

@@ -12,6 +12,17 @@ use aws_sdk_athena::Client;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200); // pyathena poll_interval=0.2
 
+/// Athena's implicit workgroup when none is configured.
+pub const DEFAULT_WORK_GROUP: &str = "primary";
+
+/// AWS console deep link to a query execution's history entry in the query editor.
+pub fn console_url(region: &str, query_execution_id: &str) -> String {
+    format!(
+        "https://{region}.console.aws.amazon.com/athena/home\
+         ?region={region}#/query-editor/history/{query_execution_id}"
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementKind {
     Select,
@@ -47,6 +58,7 @@ impl StatementKind {
 
 #[derive(Debug, Clone)]
 pub struct QueryRun {
+    pub query_execution_id: String,
     pub headers: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
     pub output_location: Option<String>,
@@ -247,6 +259,7 @@ pub async fn run_query(
     let has_result_set = !headers.is_empty();
 
     Ok(QueryRun {
+        query_execution_id: query_id,
         headers,
         rows,
         output_location,
@@ -313,6 +326,14 @@ mod tests {
         assert_eq!(
             s,
             "3 rows in set\nExecution time: 1500 ms, Data scanned: 1 TB, Approximate cost: $5.00"
+        );
+    }
+
+    #[test]
+    fn console_url_format() {
+        assert_eq!(
+            console_url("us-east-1", "abc-123"),
+            "https://us-east-1.console.aws.amazon.com/athena/home?region=us-east-1#/query-editor/history/abc-123"
         );
     }
 
