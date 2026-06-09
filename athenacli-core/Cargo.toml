@@ -19,3 +19,5 @@ comfy-table.workspace = true
 aws-config.workspace = true
 aws-sdk-athena.workspace = true
 aws-credential-types.workspace = true
+reedline.workspace = true
+arc-swap.workspace = true

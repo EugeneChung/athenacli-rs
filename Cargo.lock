@@ -96,11 +96,13 @@ name = "athenacli-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-athena",
  "comfy-table",
  "directories",
+ "reedline",
  "serde",
  "shellexpand",
  "thiserror 1.0.69",

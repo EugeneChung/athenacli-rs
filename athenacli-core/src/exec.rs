@@ -55,7 +55,25 @@ impl SqlExecute {
     /// Effective Athena workgroup; `primary` when none is configured, matching
     /// Athena's own default.
     pub fn work_group(&self) -> &str {
-        self.work_group.as_deref().unwrap_or(athena::DEFAULT_WORK_GROUP)
+        self.work_group
+            .as_deref()
+            .unwrap_or(athena::DEFAULT_WORK_GROUP)
+    }
+
+    /// Tokio handle, for spawning the background completion refresher.
+    pub fn handle(&self) -> Handle {
+        self.handle.clone()
+    }
+
+    /// A cloneable querier for completion metadata, sharing this connection.
+    pub fn querier(&self) -> crate::completion::metadata::Querier {
+        crate::completion::metadata::Querier::new(
+            self.client.clone(),
+            self.database.clone(),
+            self.catalog.clone(),
+            self.s3_staging_dir.clone(),
+            self.work_group.clone(),
+        )
     }
 
     /// AWS console URL for a query execution. `None` when the region is unknown.

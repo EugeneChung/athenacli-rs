@@ -5,14 +5,19 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use athenacli_core::completion::completer::{AthenaCompleter, Casing};
+use athenacli_core::completion::refresher::{self, Refresher};
 use athenacli_core::config::{self, Config};
 use athenacli_core::exec::SqlExecute;
 use athenacli_core::output;
 use inquire::Confirm;
 use reedline::{
-    FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus,
-    Reedline, Signal, ValidationResult, Validator,
+    default_emacs_keybindings, ColumnarMenu, Emacs, FileBackedHistory, KeyCode, KeyModifiers,
+    MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
+    ReedlineEvent, ReedlineMenu, Signal, ValidationResult, Validator,
 };
+
+const COMPLETION_MENU: &str = "completion_menu";
 
 const HISTORY_CAPACITY: usize = 2000;
 
@@ -26,7 +31,28 @@ pub fn run(exec: &SqlExecute, cfg: &Config) -> Result<()> {
         PathBuf::from(history_path),
     )?);
 
-    let mut line_editor = Reedline::create().with_history(history);
+    // Background metadata refresher feeds the completer lock-free via ArcSwap.
+    let refresher = Refresher::new(exec.handle(), exec.querier());
+    refresher.refresh();
+    let completer = AthenaCompleter::new(refresher.metadata(), exec.database.clone(), Casing::Auto);
+
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu(COMPLETION_MENU.to_string()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+
+    let mut line_editor = Reedline::create()
+        .with_history(history)
+        .with_completer(Box::new(completer))
+        .with_menu(ReedlineMenu::EngineCompleter(Box::new(
+            ColumnarMenu::default().with_name(COMPLETION_MENU),
+        )))
+        .with_edit_mode(Box::new(Emacs::new(keybindings)));
     if cfg.main.multi_line {
         line_editor = line_editor.with_validator(Box::new(SqlValidator));
     }
@@ -47,6 +73,10 @@ pub fn run(exec: &SqlExecute, cfg: &Config) -> Result<()> {
                     break;
                 }
                 run_line(exec, cfg, &buffer);
+                // DDL/USE can change schema -> refresh completion metadata.
+                if refresher::need_refresh(&buffer) {
+                    refresher.refresh();
+                }
             }
             Ok(Signal::CtrlC) => continue,
             Ok(Signal::CtrlD) => break,
