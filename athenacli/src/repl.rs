@@ -67,6 +67,9 @@ fn run_line(exec: &SqlExecute, cfg: &Config, line: &str) {
                 if i > 0 {
                     println!();
                 }
+                if let Some(url) = exec.console_url(&rs.run.query_execution_id) {
+                    println!("Athena URL: {url}");
+                }
                 if rs.run.rows.len() > output::ROW_THRESHOLD {
                     eprintln!(
                         "The result set has more than {} rows.",
@@ -93,9 +96,6 @@ fn run_line(exec: &SqlExecute, cfg: &Config, line: &str) {
                 println!("{}", rs.status());
                 if cfg.main.timing {
                     println!("Time: {:.3}s", rs.run.elapsed_ms as f64 / 1000.0);
-                }
-                if let Some(url) = exec.console_url(&rs.run.query_execution_id) {
-                    println!("Athena URL: {url}");
                 }
             }
         }
