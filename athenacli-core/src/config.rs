@@ -63,7 +63,9 @@ impl Default for MainConfig {
             key_bindings: "emacs".to_string(),
             prompt: r"\r:\d> ".to_string(),
             prompt_continuation: "-> ".to_string(),
-            timing: true,
+            // Diverges from Python (default on): client wall-clock timing is a
+            // dev-facing detail, not useful to most users.
+            timing: false,
             table_format: "ascii".to_string(),
             syntax_style: "default".to_string(),
             enable_pager: true,
@@ -173,7 +175,8 @@ mod tests {
         assert_eq!(m.history_file, "~/.athenacli/history");
         assert_eq!(m.log_level, "INFO");
         assert!(m.multi_line);
-        assert!(m.timing);
+        // Intentional divergence from Python's default-on (see MainConfig::default).
+        assert!(!m.timing);
         assert!(m.enable_pager);
         assert_eq!(m.key_bindings, "emacs");
         assert_eq!(m.prompt_continuation, "-> ");
