@@ -61,7 +61,7 @@ impl Default for MainConfig {
             multi_line: true,
             destructive_warning: "true".to_string(),
             key_bindings: "emacs".to_string(),
-            prompt: r"\r:\d> ".to_string(),
+            prompt: r"\r:\w> ".to_string(),
             prompt_continuation: "-> ".to_string(),
             // Diverges from Python (default on): client wall-clock timing is a
             // dev-facing detail, not useful to most users.
@@ -163,7 +163,7 @@ mod tests {
         let parsed: Config = toml::from_str("[main]\ntiming = false\n").expect("parse");
         assert!(!parsed.main.timing);
         assert_eq!(parsed.main.table_format, "ascii");
-        assert_eq!(parsed.main.prompt, r"\r:\d> ");
+        assert_eq!(parsed.main.prompt, r"\r:\w> ");
         // aws_profile default section is supplied by Config::default().
         assert!(parsed.aws_profile.contains_key("default"));
     }
