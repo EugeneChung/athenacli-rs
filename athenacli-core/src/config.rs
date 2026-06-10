@@ -132,10 +132,16 @@ pub fn expand(path: &str) -> String {
 
 /// Write a fresh default config to `path`, creating parent directories.
 pub fn write_default(path: &Path) -> anyhow::Result<()> {
+    save(&Config::default(), path)
+}
+
+/// Persist `cfg` to `path` (favorite queries write-back), creating parent
+/// directories. Re-serializes the whole file; TOML comments are not kept.
+pub fn save(cfg: &Config, path: &Path) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, Config::default().to_toml()?)?;
+    std::fs::write(path, cfg.to_toml()?)?;
     Ok(())
 }
 

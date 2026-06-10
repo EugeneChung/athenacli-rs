@@ -12,7 +12,7 @@ repository = "https://github.com/EugeneChung/athenacli-rs"
 [workspace.dependencies]
 anyhow = "1"
 thiserror = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"
@@ -22,7 +22,11 @@ shellexpand = "3"
 comfy-table = "7"
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
 aws-sdk-athena = "1.109"
+aws-sdk-s3 = "1"
 aws-credential-types = { version = "1.2", features = ["hardcoded-credentials"] }
+crossterm = "0.29"
+tempfile = "3"
+shlex = "1"
 clap = { version = "4", features = ["derive", "env"] }
 reedline = "0.48"
 inquire = "0.9"
