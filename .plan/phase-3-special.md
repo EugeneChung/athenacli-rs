@@ -24,23 +24,27 @@
 
 | 명령 | 단축 | arg_type | 출처 파일 |
 |---|---|---|---|
+| `help`(`\?`, `?`) | `\?` | NO_QUERY | special/main.py |
+| `exit`(`\q`) / `quit` | `\q` | NO_QUERY | special/main.py |
 | `use` | `\u` | PARSED | main.py(앱 등록) |
 | `prompt` | `\R` | PARSED | main.py |
 | `tableformat` | `\T` | PARSED | main.py |
 | `\dt [table]` | — | PARSED | dbcommands |
 | `\l` | — | RAW | dbcommands |
 | `pager` | `\P` | PARSED | iocommands |
+| `nopager` | `\n` | NO_QUERY | iocommands |
 | `tee [-o] file` | — | PARSED | iocommands |
-| `notee` | — | NO_QUERY | iocommands |
+| `notee` | — | PARSED | iocommands |
 | `\once`(`\o`) | — | PARSED | iocommands |
 | `\timing`(`\t`) | — | NO_QUERY | iocommands |
 | `system [cmd]` | — | PARSED | iocommands |
-| `watch [s] [-c] q` | — | NO_QUERY | iocommands |
+| `watch [s] [-c] q` | — | PARSED | iocommands |
+| `read [file]` | — | PARSED | iocommands |
 | `\e` 에디터 | — | (편집 경로) | iocommands |
 | `\f`/`\fs`/`\fd` | — | PARSED | iocommands(favorites) |
 | `download` | — | NO_QUERY | iocommands |
 
-> 구현 착수 시 `@special_command` 를 전수 grep 해 표를 확정하고, 누락분(help `\?` 등)을 채운다.
+> (구현 시 확정) `@special_command` 전수 grep 결과를 위 표에 반영했다. `notee`/`watch` 는 Python 코드상 기본값(PARSED)이고, `read`/`help`/`exit`/`nopager` 가 초안에서 빠져 있었다.
 
 ## 작업 순서
 
@@ -61,8 +65,8 @@
 ### 2. IO 명령 — `athenacli-core/src/special/io.rs`
 산출물: 에디터/페이저/tee/once/timing/system/watch.
 
-- `\e` 외부 에디터: `$EDITOR` + tempfile(`.sql` 접미사, `tempfile` 크레이트). Python `handle_editor_command` 의 while 루프(여러 번 편집) 포트 — 마지막 쿼리를 기본값으로 열고, 편집 결과를 다시 프롬프트 기본값으로.
-- `pager`(`\P [cmd]`): 인자 있으면 `$PAGER` 설정 + 활성화, 없으면 현재 PAGER 표시. 출력은 `minus` 로(작업 5).
+- `\e` 외부 에디터: `$VISUAL`/`$EDITOR`(기본 `vi`) + tempfile(`.sql` 접미사, `tempfile` 크레이트). Python `handle_editor_command` 의 while 루프(여러 번 편집) 포트 — 마지막 쿼리를 기본값으로 열고, 편집 결과를 다시 프롬프트 기본값으로. (구현: reedline 의 공개 API `run_edit_commands([Clear, InsertString])` 로 다음 `read_line` 버퍼를 시딩 — 제출 시에만 버퍼가 초기화되므로 Python 의 `prompt(default=sql)` 와 동일하게 동작.)
+- `pager`(`\P [cmd]`): 인자 있으면 `$PAGER` 설정 + 활성화, 없으면 현재 PAGER 표시. 출력은 외부 `$PAGER` 프로세스로(작업 5).
 - `tee [-o] file` / `notee`: 파일 append(기본)/overwrite(`-o`). 출력 라인을 tee 파일에도 기록. Python `parseargfile` 포트.
 - `\once`(`\o`): 다음 결과 1회를 파일로. 기록 후 플래그 해제(Python `unset_once_if_written`).
 - `\timing`(`\t`): TIMING 토글.
@@ -84,11 +88,12 @@
 - 저장소: Python 은 configobj 섹션에 직접 write. Rust 는 `Config.favorite_queries: HashMap` 수정 후 athenaclirc(TOML) 재직렬화 저장.
 
 ### 5. 페이저 + tee/once 출력 — `athenacli-core/src/output/pager.rs`
-산출물: `minus` 통합 + tee/once 라이터.
+산출물: 외부 `$PAGER` 프로세스 통합 + tee/once 라이터.
 
-- 출력 분기(Python `output()` 미러): 화면에 맞으면 stdout, 안 맞고 페이저 활성이면 `minus`. 마진 계산(프롬프트/푸터/timing 줄) 근사.
+- (변경) `minus` 대신 **외부 `$PAGER` 서브프로세스**(`sh -c $PAGER`, 기본 `less -R`)를 띄운다. 이유: ① `pager <cmd>` 명령의 의미가 "그 외부 명령으로 출력"이라 내장 페이저로는 재현 불가(Python `click.echo_via_pager` 도 외부 프로세스), ② 내장 페이저가 직접 raw 모드를 잡으면 reedline 과 충돌(위험 #7) — 외부 프로세스는 자기 tty 제어를 스스로 정리한다.
+- 출력 분기(Python `output()` 미러): 화면에 맞으면 stdout, 안 맞고 페이저 활성이면 페이저. 마진 계산(`get_reserved_space` min(높이*0.45, 8) + 프롬프트/상태/timing 줄) 포트.
 - 모든 출력 라인은 tee/once 파일에도 기록(상태줄은 제외 — Python 동일).
-- raw 모드 상호작용 주의(위험 #7): reedline 이 raw 모드를 잡으므로 페이저 진입/이탈 순서 조율. watch + 페이저 동시 사용 시 페이저 비활성으로 회피.
+- watch + 페이저 동시 사용 시 페이저 비활성으로 회피(Python 동일).
 
 ### 6. 다운로드 — `athenacli-core/src/special/download.rs`
 산출물: `download`(NO_QUERY).
@@ -100,7 +105,7 @@
 ### 7. 파괴적 쿼리 확인
 산출물: 실행 전 확인.
 
-- `is_destructive(sql)` 포트: Python `prompt_utils`(`queries_start_with` + mutating 키워드 `drop`/`truncate`/`delete`/`alter`/`create`/`insert`/`update`/`replace`/`load` 등). 멀티 문장이면 하나라도 파괴적이면 true.
+- `is_destructive(sql)` 포트: Python `parseutils.is_destructive` 의 실제 키워드는 **`drop`/`shutdown`/`delete`/`truncate` 4개뿐**(초안의 alter/create/insert 등은 과대 목록이었음). `queries_start_with` 미러: 문장 분리 후 주석을 건너뛴 첫 단어 비교. 멀티 문장이면 하나라도 파괴적이면 true.
 - repl 에서 정규 실행 전 `config.destructive_warning` 켜져 있으면 `inquire::Confirm`. 거절 시 중단(Python `confirm_destructive_query` 흐름 미러: None=비파괴 통과, True=실행, False=중단).
 
 ## 테스트
@@ -108,19 +113,21 @@
 ### 단위 (Python `test_dbspecial.py` 이식)
 - `parse_special_command`: `(command, verbose, arg)` 분해(공백/`+` 케이스).
 - 레지스트리 등록/탐색(case_sensitive 분기, alias).
-- 즐겨찾기 save→list→get→delete 라운드트립(임시 설정 파일).
-- `is_destructive` 멀티 문장.
-- `format_uptime`(utils) 등 보조 함수.
+- 즐겨찾기 `$1..$N` 치환(과잉/누락 인자 에러 메시지 포함).
+- `is_destructive` 멀티 문장 + 주석 스킵.
+- `parseargfile`(`-o` 분기), watch 인자 파싱, `\e` 헬퍼(detect/filename/query), S3 URL 파싱, 페이저 마진 계산.
+- (제외) `format_uptime`: Python 쪽에서도 호출처가 없는 죽은 유틸이라 이식하지 않음. `\u`/`\dt` suggest 테스트는 Phase 2 `completion/engine.rs` 에 이미 존재.
 
 ### 수동
 - 표의 각 명령 1회씩 실행. 특히 `\e`(에디터 왕복), `watch -c`(클리어), `tee`+이후 쿼리(파일 누적), `download`(파일 생성), 파괴적 쿼리 거절.
 
 ## 이 Phase 의 위험과 대응
 
-- **위험 #7 watch + 페이저 + raw 모드**: 작업 5·2. watch 중 페이저 강제 비활성으로 충돌 회피, 페이저 진입/이탈 시 reedline raw 모드와 순서 조율. 수동 테스트로 터미널 깨짐 확인.
+- **위험 #7 watch + 페이저 + raw 모드**: 작업 5·2. watch 중 페이저 강제 비활성으로 충돌 회피, 페이저는 외부 프로세스라 reedline raw 모드와 분리(read_line 밖에서만 실행). 수동 테스트로 터미널 깨짐 확인.
+- **Ctrl-C**: reedline 이 읽는 동안은 키 이벤트, 실행 중에는 SIGINT. REPL 시작 시 tokio `ctrl_c` 리스너가 전역 cancel 플래그를 세팅 → watch 의 sleep 슬라이스와 Athena 폴링 루프가 플래그를 확인(폴링 중이면 `StopQueryExecution` 후 조용히 복귀 — Python pyathena 의 KeyboardInterrupt cancel 미러). `-e` 모드는 리스너를 안 달아 기본 종료 동작 유지.
 
 ## 사용 크레이트
-minus(페이저), inquire(확인), aws-sdk-s3(download), tempfile(에디터), 기존 크레이트.
+inquire(확인), aws-sdk-s3(download), tempfile(에디터), crossterm(터미널 크기), shlex(`\f` 인자 분리), 기존 크레이트. (`minus` 는 외부 페이저 방식 채택으로 불필요.)
 
 ## 다음 단계
 Phase 3 수동 검증 후 `phase-4-style.md` 착수.

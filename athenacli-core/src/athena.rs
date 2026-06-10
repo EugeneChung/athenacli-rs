@@ -193,7 +193,18 @@ pub async fn run_query(
                     .unwrap_or("query failed without a reason");
                 return Err(anyhow!("{reason}"));
             }
-            _ => tokio::time::sleep(POLL_INTERVAL).await,
+            _ => {
+                // Ctrl-C in the REPL: stop the query server-side and bail.
+                if crate::cancel::requested() {
+                    let _ = client
+                        .stop_query_execution()
+                        .query_execution_id(&query_id)
+                        .send()
+                        .await;
+                    return Err(crate::cancel::Cancelled.into());
+                }
+                tokio::time::sleep(POLL_INTERVAL).await
+            }
         }
     };
 

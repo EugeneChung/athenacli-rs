@@ -17,6 +17,7 @@ tokio.workspace = true
 clap.workspace = true
 reedline.workspace = true
 inquire.workspace = true
+arc-swap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 shellexpand.workspace = true

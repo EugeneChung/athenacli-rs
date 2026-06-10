@@ -1,40 +1,259 @@
-//! Synchronous reedline REPL (Phase 1 minimal): history, `;`-terminated
-//! multiline, Ctrl-C/Ctrl-D, render + status + timing.
+//! Synchronous reedline REPL: history, `;`-terminated multiline,
+//! Ctrl-C/Ctrl-D, special commands, pager/tee/once output, destructive
+//! confirmation, external editor round-trip.
 
 use std::borrow::Cow;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use athenacli_core::completion::completer::{AthenaCompleter, Casing};
+use athenacli_core::completion::metadata::Metadata;
 use athenacli_core::completion::refresher::{self, Refresher};
 use athenacli_core::config::{self, Config};
 use athenacli_core::exec::SqlExecute;
-use athenacli_core::output;
+use athenacli_core::output::pager;
+use athenacli_core::special::{self, Aborted, Emit, Flow, Session, SpecialCtx};
+use athenacli_core::{athena, cancel, output};
 use inquire::Confirm;
 use reedline::{
-    default_emacs_keybindings, ColumnarMenu, Emacs, FileBackedHistory, KeyCode, KeyModifiers,
-    MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
-    ReedlineEvent, ReedlineMenu, Signal, ValidationResult, Validator,
+    default_emacs_keybindings, ColumnarMenu, EditCommand, Emacs, FileBackedHistory, KeyCode,
+    KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, ValidationResult,
+    Validator,
 };
 
 const COMPLETION_MENU: &str = "completion_menu";
 
 const HISTORY_CAPACITY: usize = 2000;
 
-pub fn run(exec: &SqlExecute, cfg: &Config) -> Result<()> {
-    let history_path = config::expand(&cfg.main.history_file);
-    if let Some(dir) = Path::new(&history_path).parent() {
+pub fn run(exec: &mut SqlExecute, cfg: &Config, config_path: &Path) -> Result<()> {
+    let mut session = Session::from_config(cfg);
+    let mut config = cfg.clone();
+    let region = exec.region.clone();
+
+    // SIGINT -> cancel flag, the Rust KeyboardInterrupt. While reedline reads,
+    // Ctrl-C arrives as a key event instead, so this only fires mid-execution.
+    exec.handle().spawn(async {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                break;
+            }
+            cancel::request();
+        }
+    });
+
+    let history_path = PathBuf::from(config::expand(&cfg.main.history_file));
+    if let Some(dir) = history_path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let history = Box::new(FileBackedHistory::with_file(
-        HISTORY_CAPACITY,
-        PathBuf::from(history_path),
-    )?);
 
     // Background metadata refresher feeds the completer lock-free via ArcSwap.
-    let refresher = Refresher::new(exec.handle(), exec.querier());
+    let mut refresher = Refresher::new(exec.handle(), exec.querier());
     refresher.refresh();
-    let completer = AthenaCompleter::new(refresher.metadata(), exec.database.clone(), Casing::Auto);
+    let mut line_editor = build_editor(
+        &history_path,
+        refresher.metadata(),
+        exec.database.clone(),
+        session.multi_line,
+    )?;
+
+    loop {
+        let prompt = AthenaPrompt {
+            left: substitute_prompt(&session.prompt_template, exec),
+            continuation: session.prompt_continuation.clone(),
+        };
+        match line_editor.read_line(&prompt) {
+            Ok(Signal::Success(buffer)) => {
+                let text = buffer.trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+
+                // `\e`: edit in $EDITOR, then seed the next prompt with the
+                // result (Python re-prompts with default=sql; repeated `\e`
+                // round-trips emerge naturally).
+                if special::io::editor_command(&text) {
+                    let filename = special::io::get_filename(&text);
+                    let mut query = special::io::get_editor_query(&text);
+                    if query.trim().is_empty() {
+                        query = session.last_query.clone().unwrap_or_default();
+                    }
+                    match special::io::open_external_editor(filename.as_deref(), &query) {
+                        Ok((sql, None)) => {
+                            line_editor.run_edit_commands(&[
+                                EditCommand::Clear,
+                                EditCommand::InsertString(sql),
+                            ]);
+                        }
+                        Ok((_, Some(message))) => eprintln!("{message}"),
+                        Err(err) => eprintln!("{err}"),
+                    }
+                    continue;
+                }
+
+                // Destructive confirmation on the whole line (Python
+                // `one_iteration`); `watch`/`read` confirm their inner
+                // statements through ctx.confirm.
+                if session.destructive_warning {
+                    match confirm_destructive(&text) {
+                        Some(false) => {
+                            println!("Wise choice!");
+                            continue;
+                        }
+                        Some(true) => println!("Your call!"),
+                        None => {}
+                    }
+                }
+
+                session.write_tee(&format!("{}{}", prompt.left, text));
+                cancel::reset();
+                let db_before = exec.database.clone();
+
+                let warn = session.destructive_warning;
+                let mut confirm = move |q: &str| {
+                    if warn {
+                        confirm_destructive(q)
+                    } else {
+                        None
+                    }
+                };
+
+                let prompt_left = prompt.left.clone();
+                let region = region.clone();
+                let mut result_count = 0usize;
+                let mut started = Instant::now();
+                let mut sink = |session: &mut Session, emit: Emit| -> Result<()> {
+                    match emit {
+                        Emit::Sql(rs) => {
+                            if result_count > 0 {
+                                println!();
+                            }
+                            if let Some(region) = &region {
+                                println!(
+                                    "Athena URL: {}",
+                                    athena::console_url(region, &rs.run.query_execution_id)
+                                );
+                            }
+                            if rs.run.rows.len() > output::ROW_THRESHOLD {
+                                eprintln!(
+                                    "The result set has more than {} rows.",
+                                    output::ROW_THRESHOLD
+                                );
+                                let proceed = Confirm::new("Do you want to continue?")
+                                    .with_default(true)
+                                    .prompt()
+                                    .unwrap_or(false);
+                                if !proceed {
+                                    eprintln!("Aborted!");
+                                    return Err(Aborted.into());
+                                }
+                            }
+                            let rendered = output::render(
+                                &rs.run.headers,
+                                &rs.run.rows,
+                                &session.table_format,
+                                rs.expanded,
+                            );
+                            let status = rs.status();
+                            pager::output(session, &prompt_left, &rendered, Some(&status));
+                            if session.timing {
+                                println!("Time: {:.3}s", rs.run.elapsed_ms as f64 / 1000.0);
+                            }
+                        }
+                        Emit::Special(sr) => {
+                            if result_count > 0 {
+                                println!();
+                            }
+                            let mut content = String::new();
+                            if let Some(title) = &sr.title {
+                                content.push_str(title);
+                            }
+                            let rendered =
+                                output::render(&sr.headers, &sr.rows, &session.table_format, false);
+                            if !rendered.is_empty() {
+                                if !content.is_empty() {
+                                    content.push('\n');
+                                }
+                                content.push_str(&rendered);
+                            }
+                            pager::output(session, &prompt_left, &content, sr.status.as_deref());
+                            if session.timing {
+                                println!("Time: {:.3}s", started.elapsed().as_secs_f64());
+                            }
+                        }
+                        Emit::ClearScreen => special::io::clear_screen(),
+                    }
+                    result_count += 1;
+                    started = Instant::now();
+                    Ok(())
+                };
+
+                let flow = {
+                    let mut ctx = SpecialCtx {
+                        exec,
+                        session: &mut session,
+                        config: &mut config,
+                        config_path,
+                        confirm: &mut confirm,
+                    };
+                    special::run_line(&mut ctx, &text, &mut sink)
+                };
+
+                match flow {
+                    Ok(Flow::Exit) => break,
+                    Ok(Flow::Continue) => {}
+                    // Ctrl-C / declined row threshold: already reported.
+                    Err(e) if e.is::<cancel::Cancelled>() => println!(),
+                    Err(e) if e.is::<Aborted>() => {}
+                    Err(e) => eprintln!("{e}"),
+                }
+                session.unset_once_if_written();
+                session.last_query = Some(text.clone());
+
+                if exec.database != db_before {
+                    // `use`: the completer/refresher capture the database, so
+                    // rebuild them around the new one.
+                    refresher = Refresher::new(exec.handle(), exec.querier());
+                    refresher.refresh();
+                    line_editor = build_editor(
+                        &history_path,
+                        refresher.metadata(),
+                        exec.database.clone(),
+                        session.multi_line,
+                    )?;
+                } else if refresher::need_refresh(&text) {
+                    // DDL/USE can change schema -> refresh completion metadata.
+                    refresher.refresh();
+                }
+            }
+            Ok(Signal::CtrlC) => continue,
+            Ok(Signal::CtrlD) => break,
+            Ok(_) => continue,
+            Err(err) => {
+                eprintln!("{err}");
+                break;
+            }
+        }
+    }
+    session.close_tee();
+    Ok(())
+}
+
+fn build_editor(
+    history_path: &Path,
+    metadata: Arc<ArcSwap<Metadata>>,
+    database: String,
+    multi_line: bool,
+) -> Result<Reedline> {
+    let history = Box::new(FileBackedHistory::with_file(
+        HISTORY_CAPACITY,
+        history_path.to_path_buf(),
+    )?);
+    let completer = AthenaCompleter::new(metadata, database, Casing::Auto);
 
     let mut keybindings = default_emacs_keybindings();
     keybindings.add_binding(
@@ -53,87 +272,28 @@ pub fn run(exec: &SqlExecute, cfg: &Config) -> Result<()> {
             ColumnarMenu::default().with_name(COMPLETION_MENU),
         )))
         .with_edit_mode(Box::new(Emacs::new(keybindings)));
-    if cfg.main.multi_line {
+    if multi_line {
         line_editor = line_editor.with_validator(Box::new(SqlValidator));
     }
-
-    let prompt = AthenaPrompt {
-        left: substitute_prompt(&cfg.main.prompt, exec),
-        continuation: cfg.main.prompt_continuation.clone(),
-    };
-
-    loop {
-        match line_editor.read_line(&prompt) {
-            Ok(Signal::Success(buffer)) => {
-                let text = buffer.trim();
-                if text.is_empty() {
-                    continue;
-                }
-                if matches!(text, "exit" | "quit" | "\\q") {
-                    break;
-                }
-                run_line(exec, cfg, &buffer);
-                // DDL/USE can change schema -> refresh completion metadata.
-                if refresher::need_refresh(&buffer) {
-                    refresher.refresh();
-                }
-            }
-            Ok(Signal::CtrlC) => continue,
-            Ok(Signal::CtrlD) => break,
-            Ok(_) => continue,
-            Err(err) => {
-                eprintln!("{err}");
-                break;
-            }
-        }
-    }
-    Ok(())
+    Ok(line_editor)
 }
 
-fn run_line(exec: &SqlExecute, cfg: &Config, line: &str) {
-    match exec.run(line) {
-        Ok(results) => {
-            for (i, rs) in results.iter().enumerate() {
-                if i > 0 {
-                    println!();
-                }
-                if let Some(url) = exec.console_url(&rs.run.query_execution_id) {
-                    println!("Athena URL: {url}");
-                }
-                if rs.run.rows.len() > output::ROW_THRESHOLD {
-                    eprintln!(
-                        "The result set has more than {} rows.",
-                        output::ROW_THRESHOLD
-                    );
-                    let proceed = Confirm::new("Do you want to continue?")
-                        .with_default(true)
-                        .prompt()
-                        .unwrap_or(false);
-                    if !proceed {
-                        eprintln!("Aborted!");
-                        break;
-                    }
-                }
-                let rendered = output::render(
-                    &rs.run.headers,
-                    &rs.run.rows,
-                    &cfg.main.table_format,
-                    rs.expanded,
-                );
-                if !rendered.is_empty() {
-                    println!("{rendered}");
-                }
-                println!("{}", rs.status());
-                if cfg.main.timing {
-                    println!("Time: {:.3}s", rs.run.elapsed_ms as f64 / 1000.0);
-                }
-            }
-        }
-        Err(err) => eprintln!("{err}"),
+/// Python `confirm_destructive_query`: `None` when not destructive or stdin
+/// is not a TTY; otherwise the user's choice.
+pub fn confirm_destructive(query: &str) -> Option<bool> {
+    if !special::is_destructive(query) || !std::io::stdin().is_terminal() {
+        return None;
     }
+    eprintln!("You're about to run a destructive command.");
+    Some(
+        Confirm::new("Do you want to proceed?")
+            .with_default(false)
+            .prompt()
+            .unwrap_or(false),
+    )
 }
 
-/// Substitute the Phase 1 prompt placeholders (`\r` region, `\d` database,
+/// Substitute the prompt placeholders (`\r` region, `\d` database,
 /// `\w` workgroup). Date/time codes are deferred to Phase 4.
 fn substitute_prompt(template: &str, exec: &SqlExecute) -> String {
     let region = exec.region.as_deref().unwrap_or("(none)");
@@ -188,12 +348,15 @@ impl Prompt for AthenaPrompt {
 struct SqlValidator;
 
 impl Validator for SqlValidator {
+    /// Python `clibuffer._multiline_exception`, verbatim.
     fn validate(&self, line: &str) -> ValidationResult {
         let trimmed = line.trim();
         if trimmed.is_empty()
+            || trimmed.starts_with('\\') // special command
             || trimmed.ends_with(';')
+            || trimmed.ends_with("\\g")
             || trimmed.ends_with("\\G")
-            || matches!(trimmed, "exit" | "quit" | "\\q")
+            || matches!(trimmed, "exit" | "quit" | ":q")
         {
             ValidationResult::Complete
         } else {

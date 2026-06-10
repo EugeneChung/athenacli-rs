@@ -73,9 +73,12 @@ pub fn resolve(cli: &CliCreds, profile_name: &str, profile: Option<&AwsProfile>)
 }
 
 /// Build an Athena client from a resolved spec. Returns the client and the
-/// region the SDK actually resolved (for the prompt). Async — call once from
-/// the owning runtime via `block_on`.
-pub async fn build_client(spec: &CredentialSpec) -> anyhow::Result<(Client, Option<String>)> {
+/// loaded SDK config (carrying the resolved region and credentials, reused
+/// for sibling clients like S3). Async — call once from the owning runtime
+/// via `block_on`.
+pub async fn build_client(
+    spec: &CredentialSpec,
+) -> anyhow::Result<(Client, aws_config::SdkConfig)> {
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).profile_name(&spec.profile);
 
     if let Some(region) = &spec.region {
@@ -101,8 +104,7 @@ pub async fn build_client(spec: &CredentialSpec) -> anyhow::Result<(Client, Opti
         base
     };
 
-    let region = sdk_config.region().map(|r| r.as_ref().to_string());
-    Ok((Client::new(&sdk_config), region))
+    Ok((Client::new(&sdk_config), sdk_config))
 }
 
 #[cfg(test)]

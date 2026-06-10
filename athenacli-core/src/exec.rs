@@ -2,6 +2,7 @@
 //! `Handle`, and drives async query execution from the synchronous REPL via
 //! `Handle::block_on` (master plan: async SDK <-> sync reedline bridge).
 
+use aws_config::SdkConfig;
 use aws_sdk_athena::Client;
 use tokio::runtime::Handle;
 
@@ -23,6 +24,7 @@ impl ResultSet {
 
 pub struct SqlExecute {
     client: Client,
+    sdk_config: SdkConfig,
     handle: Handle,
     pub database: String,
     pub catalog: String,
@@ -32,8 +34,10 @@ pub struct SqlExecute {
 }
 
 impl SqlExecute {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Client,
+        sdk_config: SdkConfig,
         handle: Handle,
         database_arg: &str,
         s3_staging_dir: Option<String>,
@@ -43,6 +47,7 @@ impl SqlExecute {
         let (catalog, database) = split_catalog_database(database_arg);
         Self {
             client,
+            sdk_config,
             handle,
             database,
             catalog,
@@ -50,6 +55,18 @@ impl SqlExecute {
             s3_staging_dir,
             work_group,
         }
+    }
+
+    /// Switch the session to `catalog.database` (the `use` special command).
+    pub fn set_database(&mut self, database_arg: &str) {
+        let (catalog, database) = split_catalog_database(database_arg);
+        self.catalog = catalog;
+        self.database = database;
+    }
+
+    /// The loaded AWS config, for building sibling service clients (S3).
+    pub fn sdk_config(&self) -> &SdkConfig {
+        &self.sdk_config
     }
 
     /// Effective Athena workgroup; `primary` when none is configured, matching
@@ -83,6 +100,19 @@ impl SqlExecute {
             .map(|region| athena::console_url(region, query_execution_id))
     }
 
+    /// Run one SQL statement (already stripped of `;`/`\G`) through the
+    /// async bridge.
+    pub fn run_sql(&self, sql: &str) -> anyhow::Result<QueryRun> {
+        self.handle.block_on(athena::run_query(
+            &self.client,
+            sql,
+            &self.database,
+            &self.catalog,
+            self.s3_staging_dir.as_deref(),
+            self.work_group.as_deref(),
+        ))
+    }
+
     /// Split, strip trailing `;`, detect `\G`, and execute each statement.
     pub fn run(&self, statement: &str) -> anyhow::Result<Vec<ResultSet>> {
         let statement = statement.trim();
@@ -101,14 +131,7 @@ impl SqlExecute {
             if sql.is_empty() {
                 continue;
             }
-            let run = self.handle.block_on(athena::run_query(
-                &self.client,
-                sql,
-                &self.database,
-                &self.catalog,
-                self.s3_staging_dir.as_deref(),
-                self.work_group.as_deref(),
-            ))?;
+            let run = self.run_sql(sql)?;
             out.push(ResultSet { run, expanded });
         }
         Ok(out)

@@ -8,7 +8,8 @@ use anyhow::Context;
 use athenacli_core::auth::{self, CliCreds};
 use athenacli_core::config::{self, Config};
 use athenacli_core::exec::SqlExecute;
-use athenacli_core::output;
+use athenacli_core::special::{self, Emit, Flow, Session, SpecialCtx};
+use athenacli_core::{athena, output};
 use clap::Parser;
 use tracing::Level;
 
@@ -54,12 +55,14 @@ fn main() -> anyhow::Result<()> {
     };
     let spec = auth::resolve(&cli_creds, &args.profile, cfg.profile(&args.profile));
 
-    let (client, resolved_region) = runtime
+    let (client, sdk_config) = runtime
         .block_on(auth::build_client(&spec))
         .context("failed to build Athena client")?;
+    let resolved_region = sdk_config.region().map(|r| r.as_ref().to_string());
 
-    let exec = SqlExecute::new(
+    let mut exec = SqlExecute::new(
         client,
+        sdk_config,
         runtime.handle().clone(),
         &args.database,
         spec.s3_staging_dir.clone(),
@@ -69,7 +72,7 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(execute) = &args.execute {
         let query = read_execute_arg(execute)?;
-        match run_oneshot(&exec, &query, &args.table_format) {
+        match run_oneshot(&mut exec, &cfg, &config_path, &query, &args.table_format) {
             Ok(()) => std::process::exit(0),
             Err(err) => {
                 eprintln!("{err}");
@@ -78,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    repl::run(&exec, &cfg)
+    repl::run(&mut exec, &cfg, &config_path)
 }
 
 /// `-e` argument: `-` reads stdin, an existing path reads the file, otherwise
@@ -99,18 +102,83 @@ fn read_execute_arg(arg: &str) -> anyhow::Result<String> {
 }
 
 /// `-e` output: Athena console URL then result tables (no status line / timing,
-/// matching Python `run_query` plus the REPL's URL line).
-fn run_oneshot(exec: &SqlExecute, query: &str, table_format: &str) -> anyhow::Result<()> {
-    for rs in exec.run(query)? {
-        if let Some(url) = exec.console_url(&rs.run.query_execution_id) {
-            println!("Athena URL: {url}");
-        }
-        let rendered = output::render(&rs.run.headers, &rs.run.rows, table_format, rs.expanded);
-        if !rendered.is_empty() {
-            println!("{rendered}");
-        }
+/// matching Python `run_query` plus the REPL's URL line). Special commands
+/// work here too, mirroring Python's shared `sqlexecute.run` path.
+fn run_oneshot(
+    exec: &mut SqlExecute,
+    cfg: &Config,
+    config_path: &Path,
+    query: &str,
+    table_format: &str,
+) -> anyhow::Result<()> {
+    let mut session = Session::from_config(cfg);
+    session.table_format = table_format.to_string();
+    let mut config = cfg.clone();
+    let region = exec.region.clone();
+
+    // Python `run_query`: confirm destructive queries up front (TTY only).
+    if session.destructive_warning && repl::confirm_destructive(query) == Some(false) {
+        println!("Wise choice. Command execution stopped.");
+        return Ok(());
     }
-    Ok(())
+
+    let warn = session.destructive_warning;
+    let mut confirm = move |q: &str| {
+        if warn {
+            repl::confirm_destructive(q)
+        } else {
+            None
+        }
+    };
+
+    let mut sink = |session: &mut Session, emit: Emit| -> anyhow::Result<()> {
+        match emit {
+            Emit::Sql(rs) => {
+                if let Some(region) = &region {
+                    println!(
+                        "Athena URL: {}",
+                        athena::console_url(region, &rs.run.query_execution_id)
+                    );
+                }
+                let rendered = output::render(
+                    &rs.run.headers,
+                    &rs.run.rows,
+                    &session.table_format,
+                    rs.expanded,
+                );
+                if !rendered.is_empty() {
+                    println!("{rendered}");
+                }
+            }
+            Emit::Special(sr) => {
+                if let Some(title) = &sr.title {
+                    println!("{title}");
+                }
+                let rendered = output::render(&sr.headers, &sr.rows, &session.table_format, false);
+                if !rendered.is_empty() {
+                    println!("{rendered}");
+                }
+                if let Some(status) = &sr.status {
+                    if !status.is_empty() {
+                        println!("{status}");
+                    }
+                }
+            }
+            Emit::ClearScreen => {}
+        }
+        Ok(())
+    };
+
+    let mut ctx = SpecialCtx {
+        exec,
+        session: &mut session,
+        config: &mut config,
+        config_path,
+        confirm: &mut confirm,
+    };
+    match special::run_line(&mut ctx, query, &mut sink)? {
+        Flow::Exit | Flow::Continue => Ok(()),
+    }
 }
 
 fn print_welcome(path: &Path) {

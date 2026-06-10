@@ -4,8 +4,10 @@
 
 pub mod athena;
 pub mod auth;
+pub mod cancel;
 pub mod completion;
 pub mod config;
 pub mod exec;
 pub mod output;
 pub mod parse;
+pub mod special;
