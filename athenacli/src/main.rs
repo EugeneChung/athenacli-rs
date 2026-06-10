@@ -183,14 +183,12 @@ fn run_oneshot(
 
 fn print_welcome(path: &Path) {
     println!(
-        "
-        Welcome to athenacli!
+        "Welcome to athenacli!
 
-        It seems this is your first time to run athenacli,
-        we generated a default config file for you
-            {}
-        Please change it accordingly, and run athenacli again.
-        ",
+It seems this is your first time to run athenacli,
+we generated a default config file for you
+    {}
+Please change it accordingly, and run athenacli again.",
         path.display()
     );
 }

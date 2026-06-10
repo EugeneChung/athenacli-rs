@@ -218,7 +218,7 @@ equivalent of the Python version's bottom toolbar:
 
 Completion metadata (databases, tables, columns) is fetched in the background
 at startup, after `use`, and after schema-changing statements (`CREATE`,
-`DROP`, `ALTER`, …), so the menu never blocks on the network.
+`DROP`, `ALTER`), so the menu never blocks on the network.
 
 - **Smart completion** (default): suggestions depend on the cursor context —
   tables after `FROM`, columns of the tables in scope after `SELECT`/`WHERE`,
@@ -307,7 +307,9 @@ interactive terminal.
 
 Ctrl-C while a query is running stops it server-side (Athena
 `StopQueryExecution`), so you stop paying for it; the REPL returns to the
-prompt. Ctrl-C while editing just clears the input.
+prompt. Ctrl-C while editing just clears the input. This only applies to
+the REPL — in one-shot mode (`-e`) Ctrl-C terminates athenacli itself and
+the query keeps running (and billing) server-side.
 
 ## Output, pager, tee
 
@@ -350,7 +352,8 @@ ap-northeast-2:default> notee
 
 Run `help` (or `\?`) inside the REPL to list these. Type them in lowercase
 as shown — most word commands accept any case, but the lowercase form always
-works. Special commands also work in `-e` one-shot mode.
+works. Special commands also work in `-e` one-shot mode, except `\e`, which
+needs the interactive prompt.
 
 | Command | Shortcut | Description |
 | --- | --- | --- |
@@ -433,8 +436,10 @@ error. The argument is:
 
 Output is the Athena console URL plus the result in `--table-format`
 (default `csv`, so it pipes cleanly); no status line, no timing. Multiple
-`;`-separated statements run in order. Special commands work here too, and
-destructive statements still ask for confirmation when run from a terminal.
+`;`-separated statements run in order. Special commands work here too
+(except `\e`), and destructive statements still ask for confirmation when
+run from a terminal. Ctrl-C does not cancel the query server-side here —
+see [Cancelling](#cancelling).
 
 ```sh
 athenacli -e "select elb_name, count(*) c from elb_logs group by 1" > out.csv
