@@ -10,4 +10,6 @@ pub mod config;
 pub mod exec;
 pub mod output;
 pub mod parse;
+pub mod prompt;
 pub mod special;
+pub mod style;

@@ -2,7 +2,6 @@
 //! Ctrl-C/Ctrl-D, special commands, pager/tee/once output, destructive
 //! confirmation, external editor round-trip.
 
-use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,17 +15,19 @@ use athenacli_core::completion::refresher::{self, Refresher};
 use athenacli_core::config::{self, Config};
 use athenacli_core::exec::SqlExecute;
 use athenacli_core::output::pager;
+use athenacli_core::prompt::AthenaPrompt;
 use athenacli_core::special::{self, Aborted, Emit, Flow, Session, SpecialCtx};
+use athenacli_core::style::highlight::SqlHighlighter;
+use athenacli_core::style::keybindings::{
+    self, COMPLETION_MENU, TOGGLE_EDIT_MODE, TOGGLE_MULTI_LINE, TOGGLE_SMART_COMPLETION,
+};
+use athenacli_core::style::{LiveToggles, Theme};
 use athenacli_core::{athena, cancel, output};
 use inquire::Confirm;
 use reedline::{
-    default_emacs_keybindings, ColumnarMenu, EditCommand, Emacs, FileBackedHistory, KeyCode,
-    KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, ValidationResult,
-    Validator,
+    ColumnarMenu, DefaultHinter, EditCommand, FileBackedHistory, MenuBuilder, Reedline,
+    ReedlineMenu, Signal, ValidationResult, Validator,
 };
-
-const COMPLETION_MENU: &str = "completion_menu";
 
 const HISTORY_CAPACITY: usize = 2000;
 
@@ -51,6 +52,14 @@ pub fn run(exec: &mut SqlExecute, cfg: &Config, config_path: &Path) -> Result<()
         let _ = std::fs::create_dir_all(dir);
     }
 
+    // F2/F3/F4 runtime state, shared with the completer/validator/prompt.
+    let toggles = Arc::new(LiveToggles::new(
+        true,
+        cfg.main.multi_line,
+        cfg.main.key_bindings.eq_ignore_ascii_case("vi"),
+    ));
+    let theme = Theme::from_colors(&cfg.colors);
+
     // Background metadata refresher feeds the completer lock-free via ArcSwap.
     let mut refresher = Refresher::new(exec.handle(), exec.querier());
     refresher.refresh();
@@ -58,13 +67,18 @@ pub fn run(exec: &mut SqlExecute, cfg: &Config, config_path: &Path) -> Result<()
         &history_path,
         refresher.metadata(),
         exec.database.clone(),
-        session.multi_line,
+        &toggles,
+        &theme,
     )?;
 
     loop {
         let prompt = AthenaPrompt {
-            left: substitute_prompt(&session.prompt_template, exec),
+            template: session.prompt_template.clone(),
             continuation: session.prompt_continuation.clone(),
+            region: exec.region.clone(),
+            database: exec.database.clone(),
+            work_group: exec.work_group().to_string(),
+            toggles: toggles.clone(),
         };
         match line_editor.read_line(&prompt) {
             Ok(Signal::Success(buffer)) => {
@@ -109,7 +123,8 @@ pub fn run(exec: &mut SqlExecute, cfg: &Config, config_path: &Path) -> Result<()
                     }
                 }
 
-                session.write_tee(&format!("{}{}", prompt.left, text));
+                let prompt_left = prompt.left_text();
+                session.write_tee(&format!("{prompt_left}{text}"));
                 cancel::reset();
                 let db_before = exec.database.clone();
 
@@ -122,7 +137,6 @@ pub fn run(exec: &mut SqlExecute, cfg: &Config, config_path: &Path) -> Result<()
                     }
                 };
 
-                let prompt_left = prompt.left.clone();
                 let region = region.clone();
                 let mut result_count = 0usize;
                 let mut started = Instant::now();
@@ -223,12 +237,35 @@ pub fn run(exec: &mut SqlExecute, cfg: &Config, config_path: &Path) -> Result<()
                         &history_path,
                         refresher.metadata(),
                         exec.database.clone(),
-                        session.multi_line,
+                        &toggles,
+                        &theme,
                     )?;
                 } else if refresher::need_refresh(&text) {
                     // DDL/USE can change schema -> refresh completion metadata.
                     refresher.refresh();
                 }
+            }
+            // F2/F3/F4: reedline suspends the typed buffer, we apply the
+            // toggle, and the next read_line restores it (Python flips these
+            // inside `key_bindings.py`; reedline keybindings cannot reach
+            // editor state, hence the host round-trip).
+            Ok(Signal::HostCommand(cmd)) => {
+                match cmd.as_str() {
+                    TOGGLE_SMART_COMPLETION => {
+                        toggles.toggle_smart_completion();
+                    }
+                    TOGGLE_MULTI_LINE => {
+                        toggles.toggle_multi_line();
+                    }
+                    TOGGLE_EDIT_MODE => {
+                        // Only the edit mode is swapped; buffer, history, and
+                        // menu survive the rebuild.
+                        let vi = toggles.toggle_vi_mode();
+                        line_editor = line_editor.with_edit_mode(keybindings::edit_mode(vi));
+                    }
+                    _ => {}
+                }
+                continue;
             }
             Ok(Signal::CtrlC) => continue,
             Ok(Signal::CtrlD) => break,
@@ -247,34 +284,34 @@ fn build_editor(
     history_path: &Path,
     metadata: Arc<ArcSwap<Metadata>>,
     database: String,
-    multi_line: bool,
+    toggles: &Arc<LiveToggles>,
+    theme: &Theme,
 ) -> Result<Reedline> {
     let history = Box::new(FileBackedHistory::with_file(
         HISTORY_CAPACITY,
         history_path.to_path_buf(),
     )?);
-    let completer = AthenaCompleter::new(metadata, database, Casing::Auto);
+    let completer = AthenaCompleter::new(metadata, database, Casing::Auto, toggles.clone());
+    let menu = ColumnarMenu::default()
+        .with_name(COMPLETION_MENU)
+        .with_text_style(theme.menu_text)
+        .with_match_text_style(theme.menu_text)
+        .with_selected_text_style(theme.menu_selected_text)
+        .with_selected_match_text_style(theme.menu_selected_text);
 
-    let mut keybindings = default_emacs_keybindings();
-    keybindings.add_binding(
-        KeyModifiers::NONE,
-        KeyCode::Tab,
-        ReedlineEvent::UntilFound(vec![
-            ReedlineEvent::Menu(COMPLETION_MENU.to_string()),
-            ReedlineEvent::MenuNext,
-        ]),
-    );
-
-    let mut line_editor = Reedline::create()
+    let line_editor = Reedline::create()
         .with_history(history)
         .with_completer(Box::new(completer))
-        .with_menu(ReedlineMenu::EngineCompleter(Box::new(
-            ColumnarMenu::default().with_name(COMPLETION_MENU),
-        )))
-        .with_edit_mode(Box::new(Emacs::new(keybindings)));
-    if multi_line {
-        line_editor = line_editor.with_validator(Box::new(SqlValidator));
-    }
+        .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
+        .with_highlighter(Box::new(SqlHighlighter::new(theme)))
+        // Python's AutoSuggestFromHistory: gray inline hint, Right to accept.
+        .with_hinter(Box::new(DefaultHinter::default().with_style(theme.hint)))
+        // The validator stays attached; F3 flips behavior through the shared
+        // toggles (a single-line session validates everything as complete).
+        .with_validator(Box::new(SqlValidator {
+            toggles: toggles.clone(),
+        }))
+        .with_edit_mode(keybindings::edit_mode(toggles.vi_mode()));
     Ok(line_editor)
 }
 
@@ -293,65 +330,17 @@ pub fn confirm_destructive(query: &str) -> Option<bool> {
     )
 }
 
-/// Substitute the prompt placeholders (`\r` region, `\d` database,
-/// `\w` workgroup). Date/time codes are deferred to Phase 4.
-fn substitute_prompt(template: &str, exec: &SqlExecute) -> String {
-    let region = exec.region.as_deref().unwrap_or("(none)");
-    let database = if exec.database.is_empty() {
-        "(none)"
-    } else {
-        &exec.database
-    };
-    template
-        .replace("\\r", region)
-        .replace("\\d", database)
-        .replace("\\w", exec.work_group())
+struct SqlValidator {
+    toggles: Arc<LiveToggles>,
 }
-
-struct AthenaPrompt {
-    left: String,
-    continuation: String,
-}
-
-impl Prompt for AthenaPrompt {
-    fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Borrowed(&self.left)
-    }
-
-    fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Borrowed("")
-    }
-
-    fn render_prompt_indicator(&self, _edit_mode: PromptEditMode) -> Cow<'_, str> {
-        Cow::Borrowed("")
-    }
-
-    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
-        Cow::Borrowed(&self.continuation)
-    }
-
-    fn render_prompt_history_search_indicator(
-        &self,
-        history_search: PromptHistorySearch,
-    ) -> Cow<'_, str> {
-        let prefix = match history_search.status {
-            PromptHistorySearchStatus::Passing => "",
-            PromptHistorySearchStatus::Failing => "failing ",
-        };
-        Cow::Owned(format!(
-            "({}reverse-search: {}) ",
-            prefix, history_search.term
-        ))
-    }
-}
-
-struct SqlValidator;
 
 impl Validator for SqlValidator {
-    /// Python `clibuffer._multiline_exception`, verbatim.
+    /// Python `clibuffer._multiline_exception`, verbatim — gated on the F3
+    /// multiline toggle (off means every entry submits immediately).
     fn validate(&self, line: &str) -> ValidationResult {
         let trimmed = line.trim();
-        if trimmed.is_empty()
+        if !self.toggles.multi_line()
+            || trimmed.is_empty()
             || trimmed.starts_with('\\') // special command
             || trimmed.ends_with(';')
             || trimmed.ends_with("\\g")

@@ -61,7 +61,7 @@ impl Default for MainConfig {
             multi_line: true,
             destructive_warning: "true".to_string(),
             key_bindings: "emacs".to_string(),
-            prompt: r"\r:\w> ".to_string(),
+            prompt: r"\r:\d> ".to_string(),
             prompt_continuation: "-> ".to_string(),
             // Diverges from Python (default on): client wall-clock timing is a
             // dev-facing detail, not useful to most users.
@@ -97,10 +97,29 @@ impl Default for Config {
         Self {
             main: MainConfig::default(),
             aws_profile,
-            colors: HashMap::new(),
+            colors: default_colors(),
             favorite_queries: HashMap::new(),
         }
     }
+}
+
+/// The `[colors]` keys this port renders, with their built-in values, so the
+/// generated config advertises what can be themed (prompt_toolkit class names
+/// from the Python template that have no reedline counterpart are dropped).
+/// Values use the prompt_toolkit style-string format (`style::parse_style`).
+fn default_colors() -> HashMap<String, String> {
+    [
+        ("completion-menu.completion", "bg:#008888 #ffffff"),
+        ("completion-menu.completion.current", "bg:#ffffff #000000"),
+        ("auto-suggestion", "#666666 italic"),
+        ("sql.keyword", "green bold"),
+        ("sql.string", "#ba2121"),
+        ("sql.number", "#666666"),
+        ("sql.comment", "#408080 italic"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
 }
 
 impl Config {
@@ -169,7 +188,7 @@ mod tests {
         let parsed: Config = toml::from_str("[main]\ntiming = false\n").expect("parse");
         assert!(!parsed.main.timing);
         assert_eq!(parsed.main.table_format, "ascii");
-        assert_eq!(parsed.main.prompt, r"\r:\w> ");
+        assert_eq!(parsed.main.prompt, r"\r:\d> ");
         // aws_profile default section is supplied by Config::default().
         assert!(parsed.aws_profile.contains_key("default"));
     }
@@ -185,6 +204,8 @@ mod tests {
         assert!(!m.timing);
         assert!(m.enable_pager);
         assert_eq!(m.key_bindings, "emacs");
+        // Python athenaclirc ships `\r:\d> ` (region:database).
+        assert_eq!(m.prompt, r"\r:\d> ");
         assert_eq!(m.prompt_continuation, "-> ");
     }
 }

@@ -23,5 +23,7 @@ aws-credential-types.workspace = true
 reedline.workspace = true
 arc-swap.workspace = true
 crossterm.workspace = true
+nu-ansi-term.workspace = true
+chrono.workspace = true
 tempfile.workspace = true
 shlex.workspace = true

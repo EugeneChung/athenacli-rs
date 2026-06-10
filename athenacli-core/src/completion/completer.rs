@@ -11,6 +11,7 @@ use reedline::{Completer as ReedlineCompleter, Span, Suggestion};
 use super::engine::{suggest_type, Suggestion as Suggest, TableRef};
 use super::metadata::Metadata;
 use crate::parse::scanner::{last_word, WordClass};
+use crate::style::LiveToggles;
 
 /// Keyword casing applied to keyword/function completions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,15 +49,46 @@ pub struct AthenaCompleter {
     metadata: Arc<ArcSwap<Metadata>>,
     dbname: String,
     keyword_casing: Casing,
+    toggles: Arc<LiveToggles>,
 }
 
 impl AthenaCompleter {
-    pub fn new(metadata: Arc<ArcSwap<Metadata>>, dbname: String, keyword_casing: Casing) -> Self {
+    pub fn new(
+        metadata: Arc<ArcSwap<Metadata>>,
+        dbname: String,
+        keyword_casing: Casing,
+        toggles: Arc<LiveToggles>,
+    ) -> Self {
         Self {
             metadata,
             dbname,
             keyword_casing,
+            toggles,
         }
+    }
+
+    /// Smart completion off (F2): match every known name whose prefix is the
+    /// current word — Python's `all_completions` path in `get_completions`
+    /// (keywords, functions, and the cached schema names; prefix-only, no
+    /// fuzzy, no recasing).
+    fn dumb_matches(&self, word_before_cursor: &str, meta: &Metadata, out: &mut Vec<Suggestion>) {
+        let keywords = KEYWORD_TREE.keys().copied();
+        let functions = FUNCTIONS.iter().copied();
+        let databases = meta.databases.iter().map(String::as_str);
+        let tables = meta.tables.iter().map(String::as_str);
+        let columns = meta.columns.values().flatten().map(String::as_str);
+        find_matches(
+            word_before_cursor,
+            keywords
+                .chain(functions)
+                .chain(databases)
+                .chain(tables)
+                .chain(columns),
+            true,
+            false,
+            None,
+            out,
+        );
     }
 
     fn match_suggestion(
@@ -191,8 +223,12 @@ impl ReedlineCompleter for AthenaCompleter {
 
         let meta = self.metadata.load();
         let mut out: Vec<Suggestion> = Vec::new();
-        for suggestion in suggest_type(line, text_before) {
-            self.match_suggestion(&suggestion, word_before_cursor, &meta, &mut out);
+        if self.toggles.smart_completion() {
+            for suggestion in suggest_type(line, text_before) {
+                self.match_suggestion(&suggestion, word_before_cursor, &meta, &mut out);
+            }
+        } else {
+            self.dumb_matches(word_before_cursor, &meta, &mut out);
         }
 
         // Stable dedup by replacement value.
@@ -431,6 +467,7 @@ mod tests {
             Arc::new(ArcSwap::from_pointee(meta)),
             "mydb".to_string(),
             Casing::Upper,
+            Arc::new(LiveToggles::new(true, true, false)),
         )
     }
 
@@ -510,5 +547,26 @@ mod tests {
         let got = values(&mut c, "SELECT foo FROM bar INNER ");
         assert!(got.contains(&"JOIN".to_string()));
         assert!(!got.contains(&"OUTER JOIN".to_string()));
+    }
+
+    #[test]
+    fn smart_completion_off_matches_any_known_prefix() {
+        let meta = Metadata {
+            tables: vec!["users".into(), "orders".into()],
+            ..Default::default()
+        };
+        let mut c = AthenaCompleter::new(
+            Arc::new(ArcSwap::from_pointee(meta)),
+            "mydb".to_string(),
+            Casing::Upper,
+            Arc::new(LiveToggles::new(false, true, false)),
+        );
+        // Context says "table after FROM", but dumb mode ignores it: any
+        // known word with this prefix qualifies, keywords included.
+        let got = values(&mut c, "SELECT * FROM us");
+        assert!(got.contains(&"users".to_string()));
+        assert!(got.contains(&"USING".to_string()));
+        // ...and nothing fuzzy: "SELECT" must not match "us".
+        assert!(!got.contains(&"SELECT".to_string()));
     }
 }

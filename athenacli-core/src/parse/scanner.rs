@@ -223,6 +223,53 @@ fn tokenize(sql: &str) -> Vec<Tok<'_>> {
     toks
 }
 
+/// Token class for syntax highlighting, the only consumer that needs full
+/// coverage of the input (including the comments `tokenize` drops).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HighlightKind {
+    Keyword,
+    Str,
+    Num,
+    Comment,
+    Default,
+}
+
+/// Contiguous spans (byte ranges) covering all of `sql`, classified for
+/// highlighting. Gaps between tokens are whitespace and/or comments; a gap
+/// containing anything visible can only be a comment, so it is styled as one
+/// (the whitespace around it renders the same either way).
+pub fn highlight_spans(sql: &str) -> Vec<(std::ops::Range<usize>, HighlightKind)> {
+    fn gap_kind(gap: &str) -> HighlightKind {
+        if gap.chars().all(char::is_whitespace) {
+            HighlightKind::Default
+        } else {
+            HighlightKind::Comment
+        }
+    }
+
+    let mut spans = Vec::new();
+    let mut prev_end = 0usize;
+    for tok in tokenize(sql) {
+        let start = tok.end - tok.text.len();
+        if prev_end < start {
+            spans.push((prev_end..start, gap_kind(&sql[prev_end..start])));
+        }
+        let kind = match tok.kind {
+            TokKind::Keyword => HighlightKind::Keyword,
+            // Backtick-quoted is an identifier, not a string literal.
+            TokKind::Str if !tok.text.starts_with('`') => HighlightKind::Str,
+            TokKind::Num => HighlightKind::Num,
+            _ => HighlightKind::Default,
+        };
+        spans.push((start..tok.end, kind));
+        prev_end = tok.end;
+    }
+    if prev_end < sql.len() {
+        spans.push((prev_end..sql.len(), gap_kind(&sql[prev_end..])));
+    }
+    spans
+}
+
 /// The final significant token of `sql` (whitespace/comments ignored).
 pub struct LastTok {
     pub text: String,
@@ -462,6 +509,7 @@ static KEYWORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         "REPLACE",
         "MSCK",
         "REPAIR",
+        "OFFSET",
         "TEMPLATE",
         "CONNECT",
         "TABLEFORMAT",
@@ -644,5 +692,39 @@ mod tests {
         assert!(query_starts_with("USE test;", &["use"]));
         assert!(!query_starts_with("DROP DATABASE test;", &["use"]));
         assert!(query_starts_with("# comment\nUSE test;", &["use"]));
+    }
+
+    // --- highlight_spans ----------------------------------------------------
+    #[test]
+    fn highlight_spans_cover_input_contiguously() {
+        let sql = "SELECT name, 42 FROM t -- trailing\n";
+        let spans = highlight_spans(sql);
+        let mut pos = 0;
+        for (range, _) in &spans {
+            assert_eq!(range.start, pos);
+            pos = range.end;
+        }
+        assert_eq!(pos, sql.len());
+    }
+
+    #[test]
+    fn highlight_spans_classify_tokens() {
+        let sql = "select 'x' from `db`.t where n = 1.5 /* c */ offset 2";
+        let spans = highlight_spans(sql);
+        let kind_of = |word: &str| {
+            let start = sql.find(word).unwrap();
+            spans
+                .iter()
+                .find(|(r, _)| r.contains(&start))
+                .map(|(_, k)| *k)
+                .unwrap()
+        };
+        assert_eq!(kind_of("select"), HighlightKind::Keyword);
+        assert_eq!(kind_of("'x'"), HighlightKind::Str);
+        assert_eq!(kind_of("`db`"), HighlightKind::Default);
+        assert_eq!(kind_of("1.5"), HighlightKind::Num);
+        assert_eq!(kind_of("/* c */"), HighlightKind::Comment);
+        assert_eq!(kind_of("offset"), HighlightKind::Keyword);
+        assert_eq!(kind_of("n "), HighlightKind::Default);
     }
 }
