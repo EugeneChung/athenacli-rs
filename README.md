@@ -4,6 +4,10 @@ A Rust port of [athenacli](https://github.com/dbcli/athenacli) — an interactiv
 terminal client for Amazon Athena with auto-completion, syntax highlighting,
 and the dbcli-style special commands. Single static binary, no Python runtime.
 
+This README is a quick tour; the complete documentation — every CLI flag,
+config key, key binding, and special command — is in the
+[user manual](docs/manual.md).
+
 ## Features
 
 - Interactive REPL with multiline editing, persistent history, and
