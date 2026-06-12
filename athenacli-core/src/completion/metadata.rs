@@ -53,6 +53,7 @@ impl Querier {
             &self.catalog,
             self.s3_staging_dir.as_deref(),
             self.work_group.as_deref(),
+            false, // background refresher: never draw on the user's terminal
         )
         .await
     }
