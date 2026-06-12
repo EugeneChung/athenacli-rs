@@ -110,6 +110,7 @@ impl SqlExecute {
             &self.catalog,
             self.s3_staging_dir.as_deref(),
             self.work_group.as_deref(),
+            true, // user-facing: show the live progress spinner
         ))
     }
 
